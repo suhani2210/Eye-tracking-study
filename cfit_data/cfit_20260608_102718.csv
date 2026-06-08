@@ -1,2 +1,0 @@
-session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,seq_shown,seq_entered,seq_correct,fatigue_self_report,response_time_ms
-20260608_102718,2026-06-08T10:27:39.029861,1,2,1,trial_response,"[('▲', 12), ('■', 15), ('★', 13)]","[12, 15, 13]",0,3,CQG7,CQG7,1,,,1,,7395
