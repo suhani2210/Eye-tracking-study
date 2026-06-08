@@ -1,0 +1,2 @@
+session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,seq_shown,seq_entered,seq_correct,fatigue_self_report,response_time_ms
+20260608_102303,2026-06-08T10:23:29.082494,1,2,1,trial_response,"[('★', 3), ('★', 6), ('■', 2), ('●', 10)]","[3, 6, 2, 10]",0,4,26AJ1,,0,,,1,,9726

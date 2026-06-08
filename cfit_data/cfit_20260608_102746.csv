@@ -1,0 +1,1 @@
+session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,seq_shown,seq_entered,seq_correct,fatigue_self_report,response_time_ms

@@ -1,0 +1,2 @@
+session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,seq_shown,seq_entered,seq_correct,fatigue_self_report,response_time_ms
+20260608_102633,2026-06-08T10:26:58.697932,1,2,1,trial_response,"[('●', 11), ('⬡', 3), ('■', 14), ('◆', 15)]","[11, 3, 14, 15]",3,4,4KCH,4KCH,1,,,1,,14009
