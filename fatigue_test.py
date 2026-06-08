@@ -1,12 +1,22 @@
 """
-
+Cognitive Fatigue Induction Task — CFIT v1.1
+==============================================
 A working memory task designed to progressively induce fatigue
 for eye-tracking ground truth data collection.
 
 Levels:
   1 — Grid recall (shapes + positions)
   2 — Grid recall + alphanumeric code entry
-  3 — Grid recall + code + letter sequence
+  3 — Grid recall + code + PVT falling-digit catch task (dual-task)
+
+Level 3 PVT mechanic:
+  During the RECALL phase, random single digits fall from the top of the
+  right panel at random intervals (2–10 s gaps, matching classic PVT).
+  The participant must CLICK exactly 3 falling digits before they reach
+  the bottom.  Each successful catch is logged with its reaction time.
+  Missing a digit (it reaches the bottom) counts as a LAPSE.
+  After 3 catches the mini-game ends; remaining digits keep falling as
+  distractors until the participant submits their recall answer.
 
 Self-report fatigue check every N trials (no recovery gap).
 All responses logged to CSV with timestamps.
@@ -19,11 +29,10 @@ import string
 import time
 import csv
 import os
+import math
 from datetime import datetime
 
-# ─────────────────────────────────────────────
 #  CONSTANTS & CONFIG
-# ─────────────────────────────────────────────
 
 GRID_SIZE          = 4      # 4x4
 BLANK_TIME_MS      = 500    # blank between stimulus and recall
@@ -40,13 +49,33 @@ COLORS = {
     "⬡": "#40E0D0",
 }
 LEVEL_CONFIG = {
-    1: {"shapes_shown": 3, "display_ms": 2500, "code_len": 0, "seq_len": 0,
+    1: {"shapes_shown": 3, "display_ms": 2500,  "code_len": 0, "pvt": False,
         "label": "Level 1 — Grid Recall"},
-    2: {"shapes_shown": 3, "display_ms": 6000, "code_len": 3, "seq_len": 0,
+    2: {"shapes_shown": 3, "display_ms": 6000,  "code_len": 3, "pvt": False,
         "label": "Level 2 — Grid + Code"},
-    3: {"shapes_shown": 4, "display_ms": 10000, "code_len": 3, "seq_len": 4,
-        "label": "Level 3 — Grid + Code + Sequence"},
+    3: {"shapes_shown": 4, "display_ms": 10000, "code_len": 3, "pvt": True,
+        "label": "Level 3 — Grid + Code + PVT"},
 }
+
+# PVT config
+PVT_TARGETS_REQUIRED      = 3      # sequence length — must catch this many IN ORDER
+PVT_TICK_MS               = 16     # ~60 fps animation tick
+PVT_BASE_SPEED            = 1.8    # px per tick at trial start
+PVT_ACCEL_INTERVAL_S      = 12     # every N seconds, digits speed up
+PVT_ACCEL_FACTOR          = 1.25   # multiply speed by this each interval
+PVT_MAX_SPEED             = 7.0    # cap so it never becomes impossible
+PVT_SPEED_VARIANCE        = 0.4    # per-digit variance around current speed
+PVT_SPAWN_INTERVAL_MS_MIN = 1800
+PVT_SPAWN_INTERVAL_MS_MAX = 7000
+PVT_DECOY_PROBABILITY     = 0.30   # 30 pct of spawns are red decoys
+PVT_PANEL_W               = 340    # width of right PVT canvas area
+PVT_PANEL_H               = 310    # shorter so Submit button stays visible
+
+PVT_ACTIVE  = "#FFD166"   # target digit (not yet needed)
+PVT_NEXT    = "#6CF5C2"   # digit you must catch right now
+PVT_DECOY   = "#E84855"   # decoy — clicking resets progress one step
+PVT_CAUGHT  = "#4CAF50"   # brief flash on correct catch
+PVT_PENALTY = "#FF6584"   # brief flash on decoy click
 
 # Colour palette
 BG         = "#0D0D12"
@@ -66,10 +95,7 @@ WRONG      = "#E84855"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfit_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-
-# ─────────────────────────────────────────────
 #  DATA LOGGER
-# ─────────────────────────────────────────────
 
 class DataLogger:
     FIELDS = [
@@ -78,7 +104,10 @@ class DataLogger:
         "stim_shapes", "stim_positions",
         "grid_correct", "grid_total",
         "code_shown", "code_entered", "code_correct",
-        "seq_shown", "seq_entered", "seq_correct",
+        # PVT fields (replaces arithmetic)
+        "pvt_targets_caught", "pvt_lapses", "pvt_penalties",
+        "pvt_catch_rts_ms",        # list of per-digit RT in ms
+        "pvt_sequence",            # the ordered sequence to catch e.g. [3,7,1]
         "fatigue_self_report",
         "response_time_ms",
     ]
@@ -98,15 +127,105 @@ class DataLogger:
         with open(self.filepath, "a", newline="") as f:
             csv.writer(f).writerow([row[k] for k in self.FIELDS])
 
+#  PVT DIGIT STATE
+
+class FallingDigit:
+    """One digit falling on the PVT canvas. Can be a target or a decoy."""
+    _id_counter = 0
+
+    def __init__(self, canvas, x, digit, speed, spawn_time, is_decoy=False):
+        FallingDigit._id_counter += 1
+        self.id         = FallingDigit._id_counter
+        self.canvas     = canvas
+        self.digit      = str(digit)
+        self.speed      = speed
+        self.y          = -28.0
+        self.x          = float(x)
+        self.caught     = False
+        self.lapsed     = False
+        self.is_decoy   = is_decoy
+        self.spawn_time = spawn_time
+
+        init_color = PVT_DECOY if is_decoy else PVT_ACTIVE
+        self.item = canvas.create_text(
+            x, self.y,
+            text=self.digit,
+            font=("Courier", 30, "bold"),
+            fill=init_color,
+            tags=("digit", f"digit_{self.id}")
+        )
+        self.hit = canvas.create_rectangle(
+            x - 24, self.y - 24, x + 24, self.y + 24,
+            fill="", outline="",
+            tags=("hit", f"hit_{self.id}")
+        )
+
+    def move(self):
+        self.y += self.speed
+        self.canvas.coords(self.item, self.x, self.y)
+        self.canvas.coords(self.hit,
+                           self.x - 24, self.y - 24,
+                           self.x + 24, self.y + 24)
+
+    def highlight_as_next(self, active=True):
+        """Visually distinguish this as the digit to catch right now."""
+        if self.is_decoy or self.caught or self.lapsed:
+            return
+        self.canvas.itemconfig(self.item,
+                               fill=PVT_NEXT if active else PVT_ACTIVE,
+                               font=("Courier", 34, "bold") if active else ("Courier", 30, "bold"))
+
+    def mark_caught(self):
+        self.caught = True
+        self.canvas.itemconfig(self.item, fill=PVT_CAUGHT)
+
+    def mark_lapsed(self):
+        self.lapsed = True
+        col = PVT_DECOY if self.is_decoy else WRONG
+        self.canvas.itemconfig(self.item, fill=col)
+
+    def mark_penalty(self):
+        """Flash for wrongly clicked decoy."""
+        self.canvas.itemconfig(self.item, fill=PVT_PENALTY)
+
+    def remove(self):
+        try:
+            self.canvas.delete(self.item)
+            self.canvas.delete(self.hit)
+        except Exception:
+            pass
+
 #  MAIN APPLICATION
 
 class CFITApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Cognitive Fatigue Induction Task  ·  CFIT v1.0")
+        self.title("Cognitive Fatigue Induction Task  ·  CFIT v1.1")
         self.configure(bg=BG)
-        self.geometry("980x780")
-        self.resizable(False, False)
+
+        # ── macOS Retina / DPI scaling fix ──────────────────────────────
+        # On Retina displays tkinter reports a scaling factor > 1.0 which
+        # makes the window appear tiny.  We detect this and compensate by
+        # asking tkinter to treat every "point" as 1 screen pixel so the
+        # window renders at the size we specify.
+        try:
+            # macOS only; harmless on other platforms
+            self.tk.call("tk", "scaling", 1.0)
+        except Exception:
+            pass
+
+        # Make the window fill a sensible portion of whatever screen is present
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        win_w = min(1100, sw - 80)
+        win_h = min(820,  sh - 80)
+        x_off = (sw - win_w) // 2
+        y_off = (sh - win_h) // 2
+        self.geometry(f"{win_w}x{win_h}+{x_off}+{y_off}")
+        self.minsize(900, 700)          # allow resize but guard against tiny
+        self.resizable(True, True)
+
         self.logger = DataLogger()
 
         # Session state
@@ -114,24 +233,41 @@ class CFITApp(tk.Tk):
         self.trial_num       = 0
         self.block_num       = 1
         self.trials_in_block = 0
-        self.trials_in_level = 0   # resets when level changes
+        self.trials_in_level = 0
 
         # Trial state
-        self.stim_items    = []   # [(shape, cell_idx), ...]
-        self.code_string   = ""
-        self.seq_string    = ""
-        self.selected_cells = {}  # cell_idx -> shape
-        self.grid_buttons  = []
+        self.stim_items     = []   # [(shape, cell_idx), ...]
+        self.code_string    = ""
+        self.selected_cells = {}
+        self.grid_buttons   = []
         self.response_start = None
 
-        # Countdown token: used to cancel stale timers after _clear_main
+        # PVT runtime state
+        self._pvt_digits        = []    # list of FallingDigit
+        self._pvt_catches        = 0    # how many in sequence caught so far
+        self._pvt_lapses         = 0    # target digits that fell off screen
+        self._pvt_penalties      = 0    # decoy clicks
+        self._pvt_catch_rts      = []   # per-catch RT in ms
+        self._pvt_running        = False
+        self._pvt_canvas         = None
+        self._pvt_spawn_token    = 0
+        self._pvt_anim_token     = 0
+        self._pvt_status_var     = None
+        self._pvt_complete       = False
+        self._pvt_sequence       = []   # e.g. [3, 7, 1] — the digits to catch in order
+        self._pvt_step           = 0    # which index in _pvt_sequence we need next
+        self._pvt_current_speed  = PVT_BASE_SPEED
+        self._pvt_start_time     = None  # time.time() when PVT started
+        self._pvt_accel_token    = 0     # cancel stale acceleration callbacks
+
+        # Timer cancellation token
         self._timer_token = 0
 
         self._setup_fonts()
         self._build_skeleton()
         self._show_welcome()
 
-    # FONTS
+    # FONTS 
 
     def _setup_fonts(self):
         self.f_title   = tkfont.Font(family="Helvetica", size=22, weight="bold")
@@ -144,10 +280,8 @@ class CFITApp(tk.Tk):
         self.f_btn     = tkfont.Font(family="Helvetica", size=12, weight="bold")
 
     # BUTTON HELPER 
-
     def _make_btn(self, parent, text, command, bg=None, fg="#FFFFFF",
                   font=None, padx=24, pady=10, pack_kwargs=None):
-        """Label-based button that respects background colour on all platforms."""
         bg   = bg   or ACCENT
         font = font or self.f_btn
         outer = tk.Frame(parent, bg=bg, cursor="hand2")
@@ -175,13 +309,13 @@ class CFITApp(tk.Tk):
     # SKELETON 
 
     def _build_skeleton(self):
-        # Top bar
-        topbar = tk.Frame(self, bg=SURFACE, height=56)
+        # Let frames size to their content — no pack_propagate(False) so
+        # nothing gets clipped on different DPI / screen sizes
+        topbar = tk.Frame(self, bg=SURFACE)
         topbar.pack(fill="x", side="top")
-        topbar.pack_propagate(False)
 
         tk.Label(topbar, text="Fatigue Induction Task", font=self.f_heading,
-                 fg=ACCENT, bg=SURFACE).pack(side="left", padx=20, pady=10)
+                 fg=ACCENT, bg=SURFACE).pack(side="left", padx=20, pady=12)
 
         self.lbl_level = tk.Label(topbar, text="", font=self.f_body,
                                   fg=TEXT_SEC, bg=SURFACE)
@@ -191,14 +325,11 @@ class CFITApp(tk.Tk):
                                   fg=TEXT_DIM, bg=SURFACE)
         self.lbl_trial.pack(side="right", padx=20)
 
-        # Main canvas
         self.main = tk.Frame(self, bg=BG)
-        self.main.pack(fill="both", expand=True, padx=40, pady=24)
+        self.main.pack(fill="both", expand=True, padx=30, pady=16)
 
-        # Status bar
-        statusbar = tk.Frame(self, bg=SURFACE, height=34)
+        statusbar = tk.Frame(self, bg=SURFACE)
         statusbar.pack(fill="x", side="bottom")
-        statusbar.pack_propagate(False)
 
         self.lbl_status = tk.Label(statusbar, text="", font=self.f_small,
                                    fg=TEXT_DIM, bg=SURFACE)
@@ -208,8 +339,8 @@ class CFITApp(tk.Tk):
                  font=self.f_small, fg=TEXT_DIM, bg=SURFACE).pack(side="right", padx=16)
 
     def _clear_main(self):
-        # Bump token so any pending countdown callbacks become no-ops
         self._timer_token += 1
+        self._stop_pvt()
         for w in self.main.winfo_children():
             w.destroy()
 
@@ -221,8 +352,7 @@ class CFITApp(tk.Tk):
         self.lbl_level.config(text=cfg["label"])
         self.lbl_trial.config(text=f"Trial {self.trial_num}  ·  Block {self.block_num}")
 
-    #  SCREENS
-
+    # SCREENS
     def _show_welcome(self):
         self._clear_main()
         self.lbl_level.config(text="")
@@ -242,6 +372,8 @@ class CFITApp(tk.Tk):
         info = ("You will be shown shapes on a grid.\n"
                 "Memorize their positions and types.\n"
                 "Then recall them on a blank grid.\n\n"
+                "At Level 3: falling digits will appear during recall —\n"
+                "click 3 of them as fast as possible.\n\n"
                 "Periodically you will rate your fatigue.\n"
                 "There are no breaks between trials.")
         tk.Label(c, text=info, font=self.f_body, fg=TEXT_SEC, bg=BG,
@@ -254,7 +386,7 @@ class CFITApp(tk.Tk):
         btn_row.pack()
         for lvl, lbl in [(1, "Level 1\nBasic"),
                          (2, "Level 2\n+ Code"),
-                         (3, "Level 3\n+ Sequence")]:
+                         (3, "Level 3\n+ PVT")]:
             self._make_btn(btn_row, lbl,
                            command=lambda l=lvl: self._start_session(l),
                            bg=SURFACE2, fg=TEXT_PRI, padx=28, pady=14,
@@ -286,8 +418,12 @@ class CFITApp(tk.Tk):
         ]
         if cfg["code_len"] > 0:
             steps.append(f"4.  Also memorise a {cfg['code_len']}-character code and type it during recall.")
-        if cfg["seq_len"] > 0:
-            steps.append(f"5.  Also memorise a {cfg['seq_len']}-letter sequence and reproduce it in order.")
+        if cfg.get("pvt"):
+            steps.append(
+                f"5.  During recall, digits fall on the right panel.\n"
+                f"    Click {PVT_TARGETS_REQUIRED} of them as quickly as possible.\n"
+                f"    Digits that reach the bottom count as lapses."
+            )
         steps.append(f"     Every {TRIALS_PER_BLOCK} trials: rate your fatigue (3-point scale).")
 
         for s in steps:
@@ -307,7 +443,7 @@ class CFITApp(tk.Tk):
                  fg=TEXT_DIM, bg=BG).place(relx=0.5, rely=0.5, anchor="center")
         self.after(ms, callback)
 
-    #  TRIAL FLOW
+    # TRIAL FLOW 
 
     def _next_trial(self):
         self.trial_num       += 1
@@ -330,13 +466,19 @@ class CFITApp(tk.Tk):
         else:
             self.code_string = ""
 
-        if cfg["seq_len"] > 0:
-            pool = string.ascii_uppercase[:8]
-            self.seq_string = "".join(random.choices(pool, k=cfg["seq_len"]))
-        else:
-            self.seq_string = ""
-
-        self.selected_cells = {}
+        # Reset PVT state
+        self._pvt_digits         = []
+        self._pvt_catches        = 0
+        self._pvt_lapses         = 0
+        self._pvt_penalties      = 0
+        self._pvt_catch_rts      = []
+        self._pvt_running        = False
+        self._pvt_complete       = False
+        self._pvt_sequence       = []
+        self._pvt_step           = 0
+        self._pvt_current_speed  = PVT_BASE_SPEED
+        self._pvt_start_time     = None
+        self.selected_cells      = {}
 
     # STIMULUS DISPLAY 
 
@@ -345,9 +487,8 @@ class CFITApp(tk.Tk):
         cfg = LEVEL_CONFIG[self.current_level]
         self._set_status("Memorise the grid.")
 
-        # Use pack into main directly — avoid place() for dynamic content
         wrapper = tk.Frame(self.main, bg=BG)
-        wrapper.pack(expand=True)  # vertically centred
+        wrapper.pack(expand=True)
 
         tk.Label(wrapper, text="Memorise", font=self.f_heading,
                  fg=TEXT_DIM, bg=BG).pack(pady=(20, 12))
@@ -356,58 +497,47 @@ class CFITApp(tk.Tk):
         grid_f.pack()
         self._draw_grid_stimulus(grid_f)
 
-        # Code display
         if self.code_string:
             tk.Label(wrapper, text="Code to memorise:",
                      font=self.f_body, fg=TEXT_DIM, bg=BG).pack(pady=(20, 4))
-            # Space out characters manually — no letterSpacing kwarg in Tkinter
             spaced = "   ".join(self.code_string)
             tk.Label(wrapper, text=spaced, font=self.f_code,
                      fg=ACCENT2, bg=BG).pack()
 
-        # Sequence display
-        if self.seq_string:
-            tk.Label(wrapper, text="Sequence to memorise (in order):",
-                     font=self.f_body, fg=TEXT_DIM, bg=BG).pack(pady=(16, 6))
-            seq_row = tk.Frame(wrapper, bg=BG)
-            seq_row.pack()
-            for i, ch in enumerate(self.seq_string):
-                box = tk.Frame(seq_row, bg=SURFACE2, width=52, height=56)
-                box.pack(side="left", padx=4)
-                box.pack_propagate(False)
-                tk.Label(box, text=str(i + 1), font=self.f_small,
-                         fg=TEXT_DIM, bg=SURFACE2).pack(pady=(6, 0))
-                tk.Label(box, text=ch, font=self.f_heading,
-                         fg=ACCENT, bg=SURFACE2).pack()
+        if cfg.get("pvt"):
+            pvt_hint = tk.Frame(wrapper, bg=SURFACE2, padx=20, pady=14)
+            pvt_hint.pack(pady=(20, 0))
+            tk.Label(pvt_hint,
+                     text=f"⚡  During recall: catch {PVT_TARGETS_REQUIRED} digits IN ORDER",
+                     font=self.f_body, fg=PVT_NEXT, bg=SURFACE2).pack()
+            tk.Label(pvt_hint,
+                     text="Green = catch it now  ·  Red = decoy, clicking costs you a step  ·  Digits accelerate over time",
+                     font=self.f_small, fg=TEXT_DIM, bg=SURFACE2).pack(pady=(4, 0))
 
-        # Progress bar
+        # Progress bar countdown
         bar_bg = tk.Frame(wrapper, bg=SURFACE2, height=5, width=420)
         bar_bg.pack(pady=(20, 6))
         bar_bg.pack_propagate(False)
         bar_fill = tk.Frame(bar_bg, bg=ACCENT, height=5)
         bar_fill.place(x=0, y=0, relwidth=1.0, height=5)
 
-        # Start countdown — capture token at call time
-        disp = cfg["display_ms"]
+        disp  = cfg["display_ms"]
         token = self._timer_token
         self._run_countdown(bar_fill, disp, disp, token)
         self.after(disp, lambda: self._safe_proceed(token, self._show_blank_then_recall))
 
     def _run_countdown(self, bar_fill, remaining, total, token):
-        """Shrink bar_fill each tick. Stops if token has changed (screen cleared)."""
         if self._timer_token != token:
             return
         if remaining <= 0:
             return
         try:
-            frac = remaining / total
-            bar_fill.place_configure(relwidth=frac)
+            bar_fill.place_configure(relwidth=max(0, remaining / total))
         except tk.TclError:
             return
         self.after(50, lambda: self._run_countdown(bar_fill, remaining - 50, total, token))
 
     def _safe_proceed(self, token, callback):
-        """Only proceed if the screen hasn't been cleared since we scheduled this."""
         if self._timer_token == token:
             callback()
 
@@ -436,21 +566,21 @@ class CFITApp(tk.Tk):
         self._set_status("")
         self.after(BLANK_TIME_MS, self._show_recall)
 
-    # RECALL PHASE
+    # RECALL PHASE 
     def _show_recall(self):
         self._clear_main()
         cfg = LEVEL_CONFIG[self.current_level]
-        self._set_status("Recall: click cells, then assign a shape.")
+        self._set_status("Recall: click cells, assign shapes."
+                         + ("  Click falling digits!" if cfg.get("pvt") else ""))
         self.response_start = time.time()
 
-        # Two-column layout
         left = tk.Frame(self.main, bg=BG)
-        left.pack(side="left", fill="y", padx=(20, 30), pady=20)
+        left.pack(side="left", fill="y", padx=(10, 20), pady=20)
 
         right = tk.Frame(self.main, bg=BG)
         right.pack(side="left", fill="both", expand=True, pady=20)
 
-        # Left: grid
+        # Left: grid recall
         tk.Label(left, text="Click the correct cells",
                  font=self.f_body, fg=TEXT_SEC, bg=BG).pack(pady=(0, 10))
 
@@ -458,7 +588,6 @@ class CFITApp(tk.Tk):
         grid_f.pack()
         self._draw_grid_recall(grid_f)
 
-        # Left: shape picker
         tk.Label(left, text="Active shape:", font=self.f_small,
                  fg=TEXT_DIM, bg=BG).pack(pady=(16, 4))
         self._active_shape = tk.StringVar(value=SHAPES[0])
@@ -480,7 +609,7 @@ class CFITApp(tk.Tk):
                                      font=self.f_small, fg=TEXT_DIM, bg=BG)
         self.lbl_selected.pack(pady=(10, 0))
 
-        # Right: code entry
+        #  Right: code entry + PVT panel OR just code entry 
         if cfg["code_len"] > 0:
             tk.Label(right, text="Type the code:", font=self.f_heading,
                      fg=TEXT_SEC, bg=BG).pack(anchor="w", pady=(0, 6))
@@ -496,31 +625,320 @@ class CFITApp(tk.Tk):
         else:
             self._code_var = None
 
-        # Right: sequence entry
-        if cfg["seq_len"] > 0:
-            tk.Label(right, text="Re-enter the sequence:", font=self.f_heading,
-                     fg=TEXT_SEC, bg=BG).pack(anchor="w", pady=(28, 6))
-            self._seq_var = tk.StringVar()
-            seq_entry = tk.Entry(right, textvariable=self._seq_var,
-                                 font=self.f_mono, fg=ACCENT,
-                                 bg=SURFACE2, insertbackground=ACCENT,
-                                 relief="flat", bd=0,
-                                 width=cfg["seq_len"] + 2,
-                                 justify="center")
-            seq_entry.pack(anchor="w", ipady=12, ipadx=12)
+        if cfg.get("pvt"):
+            self._build_pvt_panel(right)
         else:
-            self._seq_var = None
+            # Filler hint when no PVT
+            tk.Label(right,
+                     text="Select a shape from the picker,\nthen click grid cells to place it.\nClick a placed cell again to deselect.",
+                     font=self.f_small, fg=TEXT_DIM, bg=BG, justify="left").pack(anchor="w", pady=(28, 0))
 
-        tk.Label(right, text="Select a shape from the picker,\nthen click grid cells to place it.\nClick a placed cell again to deselect.",
-                 font=self.f_small, fg=TEXT_DIM, bg=BG, justify="left").pack(anchor="w", pady=(28, 0))
+        # Submit + error always BELOW code entry but BEFORE the PVT canvas
+        # so the button is never scrolled off screen
+        btn_row = tk.Frame(right, bg=BG)
+        btn_row.pack(anchor="w", pady=(14, 4))
+        self._make_btn(btn_row, "Submit Response", self._submit_response,
+                       padx=24, pady=10,
+                       pack_kwargs={"side": "left"})
 
-        self._make_btn(right, "Submit Response", self._submit_response,
-                       padx=24, pady=12,
-                       pack_kwargs={"anchor": "w", "pady": (24, 0)})
+        self._lbl_error = tk.Label(btn_row, text="", font=self.f_body,
+                                   fg=WRONG, bg=BG, justify="left", wraplength=320)
+        self._lbl_error.pack(side="left", padx=(16, 0))
+
+        # Start PVT after a short delay so canvas is fully rendered
+        if cfg.get("pvt"):
+            self.after(300, self._start_pvt)
+
+    # PVT PANEL 
+
+    def _build_pvt_panel(self, parent):
+        """Build the falling-digits panel. Packed AFTER the submit button."""
+        pvt_outer = tk.Frame(parent, bg=SURFACE2, bd=0)
+        pvt_outer.pack(anchor="w", pady=(6, 0), fill="x")
+
+        # ── Header ──
+        header = tk.Frame(pvt_outer, bg=SURFACE2)
+        header.pack(fill="x", padx=10, pady=(8, 2))
+        tk.Label(header, text="⚡ PVT — Catch the sequence in order",
+                 font=self.f_mono, fg=PVT_NEXT, bg=SURFACE2).pack(side="left")
+        self._pvt_status_var = tk.StringVar(value="Waiting…")
+        tk.Label(header, textvariable=self._pvt_status_var,
+                 font=self.f_small, fg=TEXT_DIM, bg=SURFACE2).pack(side="right")
+
+        # ── Sequence display ──
+        seq_row = tk.Frame(pvt_outer, bg=SURFACE2)
+        seq_row.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Label(seq_row, text="Sequence: ", font=self.f_small,
+                 fg=TEXT_DIM, bg=SURFACE2).pack(side="left")
+        self._pvt_seq_labels = []   # will be filled in _start_pvt
+        for _ in range(PVT_TARGETS_REQUIRED):
+            lbl = tk.Label(seq_row, text="?", font=self.f_mono,
+                           fg=TEXT_DIM, bg=SURFACE2, width=3)
+            lbl.pack(side="left", padx=3)
+            self._pvt_seq_labels.append(lbl)
+
+        # Stats row 
+        stats = tk.Frame(pvt_outer, bg=SURFACE2)
+        stats.pack(fill="x", padx=10, pady=(0, 4))
+        self._pvt_catch_lbl = tk.Label(stats, text="Progress: 0/3",
+                                        font=self.f_small, fg=CORRECT, bg=SURFACE2)
+        self._pvt_catch_lbl.pack(side="left", padx=(0, 12))
+        self._pvt_lapse_lbl = tk.Label(stats, text="Lapses: 0",
+                                        font=self.f_small, fg=WRONG, bg=SURFACE2)
+        self._pvt_lapse_lbl.pack(side="left", padx=(0, 12))
+        self._pvt_penalty_lbl = tk.Label(stats, text="Penalties: 0",
+                                          font=self.f_small, fg=PVT_PENALTY, bg=SURFACE2)
+        self._pvt_penalty_lbl.pack(side="left")
+        self._pvt_rt_lbl = tk.Label(stats, text="Last RT: —",
+                                     font=self.f_small, fg=TEXT_DIM, bg=SURFACE2)
+        self._pvt_rt_lbl.pack(side="right")
+        self._pvt_speed_lbl = tk.Label(stats, text="Speed: 1×",
+                                        font=self.f_small, fg=TEXT_DIM, bg=SURFACE2)
+        self._pvt_speed_lbl.pack(side="right", padx=(0, 12))
+
+        # Canvas
+        self._pvt_canvas = tk.Canvas(
+            pvt_outer,
+            width=PVT_PANEL_W, height=PVT_PANEL_H,
+            bg=BG, bd=0, highlightthickness=1,
+            highlightbackground=SURFACE
+        )
+        self._pvt_canvas.pack(padx=10, pady=(0, 10))
+
+        # Subtle lane guides
+        for x_frac in [0.25, 0.5, 0.75]:
+            x = int(PVT_PANEL_W * x_frac)
+            self._pvt_canvas.create_line(x, 0, x, PVT_PANEL_H,
+                                         fill=SURFACE2, dash=(3, 10))
+
+        self._pvt_canvas.bind("<Button-1>", self._pvt_canvas_click)
+
+    def _start_pvt(self):
+        if not self._pvt_canvas:
+            return
+
+        # Generate the target sequence
+        self._pvt_sequence = random.sample(range(1, 10), PVT_TARGETS_REQUIRED)
+        self._pvt_step     = 0
+
+        # Populate sequence display labels
+        for i, lbl in enumerate(self._pvt_seq_labels):
+            lbl.config(text=str(self._pvt_sequence[i]),
+                       fg=PVT_NEXT if i == 0 else TEXT_DIM)
+
+        self._pvt_running      = True
+        self._pvt_complete     = False
+        self._pvt_current_speed = PVT_BASE_SPEED
+        self._pvt_start_time   = time.time()
+
+        self._pvt_spawn_token += 1
+        self._pvt_anim_token  += 1
+        self._pvt_accel_token += 1
+
+        self._pvt_status_var.set(f"Catch  {self._pvt_sequence[0]}  first →")
+        self._pvt_schedule_spawn(self._pvt_spawn_token)
+        self._pvt_animate(self._pvt_anim_token)
+        self._pvt_accelerate(self._pvt_accel_token)
+
+    def _stop_pvt(self):
+        self._pvt_running      = False
+        self._pvt_spawn_token  += 1
+        self._pvt_anim_token   += 1
+        self._pvt_accel_token  += 1
+        for d in self._pvt_digits:
+            try:
+                d.remove()
+            except Exception:
+                pass
+        self._pvt_digits  = []
+        self._pvt_canvas  = None
+
+    def _pvt_accelerate(self, token):
+        """Periodically increase fall speed."""
+        if not self._pvt_running or self._pvt_accel_token != token:
+            return
+        self._pvt_current_speed = min(
+            self._pvt_current_speed * PVT_ACCEL_FACTOR,
+            PVT_MAX_SPEED
+        )
+        mult = self._pvt_current_speed / PVT_BASE_SPEED
+        try:
+            self._pvt_speed_lbl.config(text=f"Speed: {mult:.1f}×")
+        except Exception:
+            pass
+        self.after(int(PVT_ACCEL_INTERVAL_S * 1000),
+                   lambda: self._pvt_accelerate(token))
+
+    def _pvt_schedule_spawn(self, token):
+        if not self._pvt_running or self._pvt_spawn_token != token:
+            return
+        delay = random.randint(PVT_SPAWN_INTERVAL_MS_MIN, PVT_SPAWN_INTERVAL_MS_MAX)
+        self.after(delay, lambda: self._pvt_spawn_digit(token))
+
+    def _pvt_spawn_digit(self, token):
+        if not self._pvt_running or self._pvt_spawn_token != token:
+            return
+        if not self._pvt_canvas:
+            return
+
+        lanes = [int(PVT_PANEL_W * f) for f in [0.15, 0.35, 0.57, 0.79]]
+        occupied = {d.x for d in self._pvt_digits
+                    if not d.caught and not d.lapsed and d.y < PVT_PANEL_H * 0.25}
+        choices = [x for x in lanes if x not in occupied] or lanes
+        x = random.choice(choices)
+
+        is_decoy = random.random() < PVT_DECOY_PROBABILITY
+
+        if is_decoy:
+            # Decoy digit — never matches the next needed digit
+            avoid = self._pvt_sequence[self._pvt_step] if self._pvt_step < len(self._pvt_sequence) else -1
+            pool  = [d for d in range(1, 10) if d != avoid]
+            digit = random.choice(pool)
+        else:
+            # Target digit — IS the next needed digit, so participant can try to catch it
+            digit = self._pvt_sequence[self._pvt_step] if self._pvt_step < len(self._pvt_sequence) else random.randint(1, 9)
+
+        variance = random.uniform(-PVT_SPEED_VARIANCE, PVT_SPEED_VARIANCE)
+        speed    = max(1.0, self._pvt_current_speed + variance)
+
+        d = FallingDigit(self._pvt_canvas, x, digit, speed, time.time(), is_decoy=is_decoy)
+
+        # Highlight if this is the exact next-needed digit (and not a decoy)
+        if not is_decoy and str(digit) == str(self._pvt_sequence[self._pvt_step]):
+            d.highlight_as_next(True)
+
+        self._pvt_digits.append(d)
+        self._pvt_schedule_spawn(token)
+
+    def _pvt_animate(self, token):
+        if not self._pvt_anim_token == token:
+            return
+        if not self._pvt_canvas:
+            return
+
+        to_remove = []
+        for d in self._pvt_digits:
+            if d.caught or d.lapsed:
+                continue
+            d.move()
+            if d.y >= PVT_PANEL_H + 28:
+                d.mark_lapsed()
+                if not d.is_decoy:
+                    self._pvt_lapses += 1
+                    self._pvt_update_stats()
+                to_remove.append(d)
+
+        for d in to_remove:
+            self.after(180, d.remove)
+            if d in self._pvt_digits:
+                self._pvt_digits.remove(d)
+
+        self.after(PVT_TICK_MS, lambda: self._pvt_animate(token))
+
+    def _pvt_canvas_click(self, event):
+        if self._pvt_complete:
+            return
+
+        cx, cy     = event.x, event.y
+        click_time = time.time()
+
+        # Find closest digit within hit radius
+        best, best_dist = None, float("inf")
+        for d in self._pvt_digits:
+            if d.caught or d.lapsed:
+                continue
+            dist = math.hypot(cx - d.x, cy - d.y)
+            if dist < 32 and dist < best_dist:
+                best, best_dist = d, dist
+
+        if best is None:
+            return
+
+        if best.is_decoy:
+            # Penalty: step back one (but not below 0)
+            best.mark_penalty()
+            self.after(300, best.remove)
+            if best in self._pvt_digits:
+                self._pvt_digits.remove(best)
+            self._pvt_penalties += 1
+            if self._pvt_step > 0:
+                self._pvt_step -= 1
+            self._pvt_update_stats()
+            self._pvt_refresh_highlights()
+            return
+
+        # It's a real digit — check if it's the one we need
+        needed = str(self._pvt_sequence[self._pvt_step])
+        if best.digit != needed:
+            # Wrong order — flash red briefly but don't remove
+            self._pvt_canvas.itemconfig(best.item, fill=WRONG)
+            self.after(300, lambda: self._pvt_canvas.itemconfig(
+                best.item, fill=PVT_ACTIVE) if not best.caught else None)
+            return
+
+        # Correct catch!
+        rt_ms = int((click_time - best.spawn_time) * 1000)
+        best.mark_caught()
+        self._pvt_catches   += 1
+        self._pvt_step      += 1
+        self._pvt_catch_rts.append(rt_ms)
+        self.after(240, best.remove)
+        if best in self._pvt_digits:
+            self._pvt_digits.remove(best)
+
+        self._pvt_update_stats(last_rt=rt_ms)
+        self._pvt_refresh_highlights()
+
+        if self._pvt_catches >= PVT_TARGETS_REQUIRED:
+            self._pvt_complete = True
+            self._pvt_running  = False
+            self._pvt_spawn_token += 1
+            try:
+                self._pvt_status_var.set("✓ Done — submit when ready")
+                for lbl in self._pvt_seq_labels:
+                    lbl.config(fg=CORRECT)
+            except Exception:
+                pass
+
+    def _pvt_refresh_highlights(self):
+        """Re-colour falling digits so the current target is highlighted green."""
+        if self._pvt_step >= len(self._pvt_sequence):
+            return
+        needed = str(self._pvt_sequence[self._pvt_step])
+        try:
+            self._pvt_status_var.set(f"Catch  {needed}  next →")
+        except Exception:
+            pass
+        # Update sequence indicator labels
+        for i, lbl in enumerate(self._pvt_seq_labels):
+            if i < self._pvt_step:
+                lbl.config(fg=CORRECT)          # already caught
+            elif i == self._pvt_step:
+                lbl.config(fg=PVT_NEXT)         # next target
+            else:
+                lbl.config(fg=TEXT_DIM)         # upcoming
+        # Highlight active falling targets
+        for d in self._pvt_digits:
+            if d.caught or d.lapsed or d.is_decoy:
+                continue
+            d.highlight_as_next(d.digit == needed)
+
+    def _pvt_update_stats(self, last_rt=None):
+        try:
+            self._pvt_catch_lbl.config(
+                text=f"Progress: {self._pvt_catches}/{PVT_TARGETS_REQUIRED}")
+            self._pvt_lapse_lbl.config(text=f"Lapses: {self._pvt_lapses}")
+            self._pvt_penalty_lbl.config(text=f"Penalties: {self._pvt_penalties}")
+            if last_rt is not None:
+                self._pvt_rt_lbl.config(text=f"Last RT: {last_rt} ms")
+        except Exception:
+            pass
+
+    # GRID RECALL HELPERS 
 
     def _draw_grid_recall(self, parent):
         CELL = 88
-        self.grid_buttons  = []
+        self.grid_buttons   = []
         self.selected_cells = {}
 
         for row in range(GRID_SIZE):
@@ -569,22 +987,44 @@ class CFITApp(tk.Tk):
             lbl.config(text=sh, fg=COLORS[sh], bg=GRID_SEL)
         self.lbl_selected.config(text=f"Selected: {len(self.selected_cells)} cells")
 
-    # ── SUBMIT ────────────────────────────────
+    # SUBMIT
 
     def _submit_response(self):
-        rt_ms = int((time.time() - self.response_start) * 1000)
-
-        correct_set = {(sh, cell) for sh, cell in self.stim_items}
-        user_set    = {(sh, cell) for cell, sh in self.selected_cells.items()}
+        correct_set  = {(sh, cell) for sh, cell in self.stim_items}
+        user_set     = {(sh, cell) for cell, sh in self.selected_cells.items()}
         grid_correct = len(correct_set & user_set)
         grid_total   = len(correct_set)
 
         code_entered = self._code_var.get().strip().upper() if self._code_var else ""
         code_correct = (code_entered == self.code_string) if self.code_string else True
 
-        seq_entered  = self._seq_var.get().strip().upper() if self._seq_var else ""
-        seq_correct  = (seq_entered == self.seq_string) if self.seq_string else True
+        # PVT: require all 3 catches before allowing submit
+        cfg = LEVEL_CONFIG[self.current_level]
+        pvt_ok = True
+        if cfg.get("pvt"):
+            if self._pvt_catches < PVT_TARGETS_REQUIRED:
+                pvt_ok = False
 
+        all_correct = (grid_correct == grid_total) and code_correct and pvt_ok
+
+        if not all_correct:
+            errors = []
+            if grid_correct < grid_total:
+                errors.append(f"Grid: {grid_correct}/{grid_total} correct")
+            if not code_correct:
+                errors.append("Code is wrong")
+            if not pvt_ok:
+                remaining = PVT_TARGETS_REQUIRED - self._pvt_catches
+                errors.append(f"Catch {remaining} more falling digit(s) first")
+            self._lbl_error.config(text="Not yet: " + "  ·  ".join(errors))
+            return
+
+        # Stop PVT cleanly
+        if cfg.get("pvt"):
+            self._pvt_running = False
+            self._pvt_spawn_token += 1
+
+        rt_ms = int((time.time() - self.response_start) * 1000)
         self.logger.log(
             trial_num=self.trial_num,
             level=self.current_level,
@@ -597,44 +1037,58 @@ class CFITApp(tk.Tk):
             code_shown=self.code_string,
             code_entered=code_entered,
             code_correct=int(code_correct),
-            seq_shown=self.seq_string,
-            seq_entered=seq_entered,
-            seq_correct=int(seq_correct),
+            pvt_targets_caught=self._pvt_catches,
+            pvt_lapses=self._pvt_lapses,
+            pvt_catch_rts_ms=str(self._pvt_catch_rts),
+            pvt_penalties=self._pvt_penalties,
+            pvt_sequence=str(self._pvt_sequence),
             response_time_ms=rt_ms,
         )
 
-        self._show_feedback(grid_correct, grid_total, code_correct, seq_correct)
+        self._show_feedback(grid_correct, grid_total, code_correct)
 
     # FEEDBACK
-    def _show_feedback(self, gc, gt, cc, sc):
+
+    def _show_feedback(self, gc, gt, cc):
         self._clear_main()
         cfg = LEVEL_CONFIG[self.current_level]
 
         wrapper = tk.Frame(self.main, bg=BG)
         wrapper.pack(expand=True)
 
-        score_col = CORRECT if gc == gt else (ACCENT if gc > gt // 2 else WRONG)
-        tk.Label(wrapper, text=f"Grid: {gc} / {gt}", font=self.f_heading,
-                 fg=score_col, bg=BG).pack(pady=6)
+        tk.Label(wrapper, text="Correct!", font=self.f_title,
+                 fg=CORRECT, bg=BG).pack(pady=(0, 6))
+        tk.Label(wrapper, text=f"Grid: {gc} / {gt}", font=self.f_body,
+                 fg=TEXT_SEC, bg=BG).pack(pady=2)
 
         if cfg["code_len"] > 0:
-            col = CORRECT if cc else WRONG
-            tk.Label(wrapper, text=f"Code: {'Correct' if cc else 'Wrong'}",
-                     font=self.f_body, fg=col, bg=BG).pack(pady=2)
+            tk.Label(wrapper, text="Code: Correct", font=self.f_body,
+                     fg=TEXT_SEC, bg=BG).pack(pady=2)
 
-        if cfg["seq_len"] > 0:
-            col = CORRECT if sc else WRONG
-            tk.Label(wrapper, text=f"Sequence: {'Correct' if sc else 'Wrong'}",
-                     font=self.f_body, fg=col, bg=BG).pack(pady=2)
+        if cfg.get("pvt") and self._pvt_catch_rts:
+            mean_rt = int(sum(self._pvt_catch_rts) / len(self._pvt_catch_rts))
+            seq_str = " → ".join(str(d) for d in self._pvt_sequence)
+            pvt_summary = (
+                f"PVT sequence: {seq_str}   "
+                f"Lapses: {self._pvt_lapses}   "
+                f"Penalties: {self._pvt_penalties}   "
+                f"Mean RT: {mean_rt} ms"
+            )
+            rt_col = CORRECT if mean_rt < 500 else ACCENT2
+            tk.Label(wrapper, text=pvt_summary, font=self.f_body,
+                     fg=rt_col, bg=BG).pack(pady=2)
+            rt_str = "  ".join([f"{r} ms" for r in self._pvt_catch_rts])
+            tk.Label(wrapper, text=f"RTs: {rt_str}",
+                     font=self.f_small, fg=TEXT_DIM, bg=BG).pack(pady=(2, 0))
 
-        answer = "  ".join([f"{sh} -> cell {cell}" for sh, cell in self.stim_items])
+        answer = "  ".join([f"{sh} → cell {cell}" for sh, cell in self.stim_items])
         tk.Label(wrapper, text=f"Correct answer: {answer}",
                  font=self.f_small, fg=TEXT_DIM, bg=BG, wraplength=600).pack(pady=(14, 0))
 
-        # Level progress indicator 
-        TRIALS_PER_LEVEL = TRIALS_PER_BLOCK * 3   # 15
-        done  = self.trials_in_level
-        left  = TRIALS_PER_LEVEL - done
+        # Level progress bar
+        TRIALS_PER_LEVEL = TRIALS_PER_BLOCK * 3
+        done = self.trials_in_level
+        left = TRIALS_PER_LEVEL - done
 
         if self.current_level < 3:
             prog_frame = tk.Frame(wrapper, bg=SURFACE2, padx=20, pady=12)
@@ -647,7 +1101,6 @@ class CFITApp(tk.Tk):
             tk.Label(header, text=f"{done} / {TRIALS_PER_LEVEL} trials",
                      font=self.f_small, fg=TEXT_SEC, bg=SURFACE2).pack(side="right")
 
-            # Bar track
             bar_track = tk.Frame(prog_frame, bg=GRID_IDLE, height=8)
             bar_track.pack(fill="x", pady=(6, 8))
             bar_track.pack_propagate(False)
@@ -656,25 +1109,25 @@ class CFITApp(tk.Tk):
             bar_fill.place(x=0, y=0, relwidth=frac, height=8)
 
             if left <= 0:
-                msg     = "Level up next!"
-                msg_col = ACCENT2
+                msg, msg_col = "Level up next!", ACCENT2
             elif left == 1:
-                msg     = "1 trial until next level"
-                msg_col = ACCENT2
+                msg, msg_col = "1 trial until next level", ACCENT2
             else:
-                msg     = f"{left} trials until next level"
-                msg_col = TEXT_SEC
+                msg, msg_col = f"{left} trials until next level", TEXT_SEC
             tk.Label(prog_frame, text=msg, font=self.f_small,
                      fg=msg_col, bg=SURFACE2).pack(anchor="w")
         else:
-            # Already at max level — show overall trial count only
             tk.Label(wrapper, text=f"Max level  ·  Trial {self.trial_num} overall",
                      font=self.f_small, fg=TEXT_DIM, bg=BG).pack(pady=(18, 0))
 
         if self.trials_in_block >= TRIALS_PER_BLOCK:
-            self.after(1200, self._show_fatigue_report)
+            next_label, next_cmd = "Rate Fatigue →", self._show_fatigue_report
         else:
-            self.after(1200, self._next_trial)
+            next_label, next_cmd = "Next Trial →", self._next_trial
+
+        self._make_btn(wrapper, next_label, next_cmd,
+                       bg=ACCENT, padx=28, pady=12,
+                       pack_kwargs={"pady": (24, 0)})
 
     # FATIGUE SELF-REPORT
 
@@ -691,9 +1144,9 @@ class CFITApp(tk.Tk):
                  font=self.f_small, fg=TEXT_DIM, bg=BG).pack(pady=(0, 28))
 
         options = [
-            ("1", "Normal",           CORRECT, "Alert and focused"),
-            ("2", "Mildly Fatigued",  ACCENT,  "Somewhat tired, effort required"),
-            ("3", "Severely Fatigued",WRONG,   "Very tired, struggling to concentrate"),
+            ("1", "Normal",            CORRECT, "Alert and focused"),
+            ("2", "Mildly Fatigued",   ACCENT,  "Somewhat tired, effort required"),
+            ("3", "Severely Fatigued", WRONG,   "Very tired, struggling to concentrate"),
         ]
         for val, label, col, sub in options:
             btn_f = tk.Frame(wrapper, bg=SURFACE2, cursor="hand2")
@@ -725,7 +1178,7 @@ class CFITApp(tk.Tk):
         self._set_status("")
         self._show_block_transition()
 
-    # BLOCK TRANSITION
+    # BLOCK TRANSITION 
 
     def _show_block_transition(self):
         self._clear_main()
@@ -736,7 +1189,6 @@ class CFITApp(tk.Tk):
         tk.Label(wrapper, text=f"Block {self.block_num} starting",
                  font=self.f_heading, fg=ACCENT, bg=BG).pack(pady=(0, 8))
 
-        # Escalate every 3 blocks
         can_escalate = (self.current_level < 3) and (self.block_num % 3 == 0)
         if can_escalate:
             tk.Label(wrapper, text="Difficulty increasing.",
@@ -757,7 +1209,8 @@ class CFITApp(tk.Tk):
             self._update_header()
         self._next_trial()
 
-#  ENTRY POINT
+
+# ENTRY POINT 
 
 if __name__ == "__main__":
     app = CFITApp()
