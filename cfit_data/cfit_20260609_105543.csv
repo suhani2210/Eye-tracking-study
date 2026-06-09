@@ -1,0 +1,1 @@
+session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,pvt_targets_caught,pvt_lapses,pvt_penalties,pvt_catch_rts_ms,pvt_sequence,fatigue_self_report,response_time_ms

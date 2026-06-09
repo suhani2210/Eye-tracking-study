@@ -1,0 +1,2 @@
+session_id,timestamp,trial_num,level,block_num,event_type,stim_shapes,stim_positions,grid_correct,grid_total,code_shown,code_entered,code_correct,pvt_targets_caught,pvt_lapses,pvt_penalties,pvt_catch_rts_ms,pvt_sequence,fatigue_self_report,response_time_ms
+20260609_110857,2026-06-09T11:09:38.715481,1,3,1,trial_response,"[('⬡', 15), ('★', 12), ('■', 2), ('▲', 9)]","[15, 12, 2, 9]",2,4,ADP,,0,2,0,0,"[1712, 1775]","[1, 7, 8]",,26226
